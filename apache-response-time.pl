@@ -1,0 +1,706 @@
+#!/usr/bin/perl
+# # Copyright (C) 2008 Derek Wilson and the MRC #
+# This program may be freely redistributed and/or modified
+# under the terms of the GNU General Public License as published
+# by the Free Software Foundation; either version 2 of the
+# License, or (at your option) any later version.
+#
+# Author:        Derek Wilson
+# Email:         derekw@derekw.org
+# File:          apache_response_time
+# Created:       22/06/09
+# Downloads:
+# Summary:       Analyse apache response times
+# Description:   Parse apache access log and report slowest requests
+# Usage:         apache_response_time
+# Limitations:
+# Dependencies:
+# Subroutines:
+# Inputs:        apache access log
+# Outputs:
+# Modifications:
+# ToDo:          See also TODOs in code
+# Bug/Fix:
+# Last modified:
+#
+
+###############################################################################
+#
+#
+
+# pragmas
+use strict;
+use warnings;
+
+# predeclare subroutines so we can call them without parenthesis
+use subs qw(say slurp query);
+
+# modules
+use Getopt::Long;
+use POSIX;
+
+# Debug
+#use YAML;
+
+
+# constants
+my $TIME_UNIT        = 1_000_000;
+my $BYTES_UNIT       = 1024;
+my $DEF_LIMIT        = 10;
+my @VALID_ORDER      = qw( time calls call_time bytes );
+#my $BIN_PATH         = 'cgi-bin';
+my $BIN_PATH         = '';
+#my $SCRIPT_EXTENSION = 'cgi';
+my $SCRIPT_EXTENSION = '';
+my $SERVER           = '';
+
+# CLI options and defaults
+my $logfile = '/var/log/apache2/access.log';
+my $LIMIT   = $DEF_LIMIT;
+my $ORDER   = 'calls';
+my $help    = 0;
+my $date_re;
+
+
+# use today's date for default date regex and rate calc
+my @months = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+my ( $sec,          $minute,      $hour,
+     $day_of_month, $month,       $year_offset,
+     $day_of_week,  $day_of_year, $daylight_savings) = localtime;
+
+my $year = 1900 + $year_offset;
+if ( length $day_of_month == 1 ) {
+    $day_of_month = "0$day_of_month";
+}
+
+$date_re = "$day_of_month/$months[$month]/$year";
+
+my $epoch_now      = mktime localtime;
+my $epoch_midnight = mktime(
+    0,      0,            0,            $day_of_month,
+    $month, $year_offset, $day_of_week, $day_of_year,
+    $daylight_savings
+);
+my $elapsed_secs = $epoch_now - $epoch_midnight;
+
+
+GetOptions(
+    'a|access-log=s' => \$logfile,
+    'l|limit=i'      => \$LIMIT,
+    'o|order-by=s'   => \$ORDER,
+    'd|date=s'       => \$date_re,
+    's|server=s'     => \$SERVER,
+    'b|bin-path=s'   => \$BIN_PATH,
+    'e|extension'    => \$SCRIPT_EXTENSION,
+    'help|?'         => \$help,
+) or usage( $DEF_LIMIT, \@VALID_ORDER );
+
+# Check for BIN_PATH only if supplied
+my $BIN_PATH_RE = "";
+if ( $BIN_PATH ne '') {
+	my $BIN_PATH_RE = "\/$BIN_PATH\/";
+}
+
+
+usage( $DEF_LIMIT, \@VALID_ORDER ) if $help;
+
+check_cli_opts( $logfile, $LIMIT, $ORDER, $date_re, \@VALID_ORDER );
+
+
+#LogFormat "%h %l %u %t \"%r\" %>s %b %D \"%{Referer}i\" \"%{User-Agent}i\" %T %v" full
+#LogFormat "%h %l %u %t \"%r\" %>s %b %D \"%{Referer}i\" \"%{User-Agent}i\" %P %T" debug
+#LogFormat "%h %l %u %t \"%r\" %>s %b %D \"%{Referer}i\" \"%{User-Agent}i\"" combined
+#LogFormat "%h %l %u %t \"%r\" %>s %b %D" common
+#LogFormat "%{Referer}i -> %U" referer
+#LogFormat "%{User-agent}i" agent
+
+# 216.129.119.41 - - [22/Jun/2009:10:32:52 +0100] "GET /SUPERFAMILY/cgi-bin/dot.cgi?sf=52029;type=superfamily HTTP/1.0" 200 5668 44895720 "-" "Mozilla/5.0 (Twiceler-0.9 http://www.cuil.com/twiceler/robot.html)"
+
+
+my %url_count;
+
+my %script_stats = get_stats();
+
+my $script_stats_ref = calc_summary_stats( \%script_stats, $elapsed_secs );
+
+print_summary_stats( $script_stats_ref );
+print_ranked_stats( $script_stats_ref, $LIMIT );
+print_detailed_stats( $script_stats_ref, $LIMIT );
+print_most_freq_urls( \%url_count );
+
+
+exit 0;
+
+
+###############################################################################
+#
+#
+
+sub get_stats {
+
+    my @lines = slurp $logfile;
+
+    foreach (@lines) {
+        if ( /^(\S+?)\s-\s-\s(\[.*?\])\s(.*?)\s(\d+)\s(\d+)\s(\d+)/ ) {
+            my $ip     = $1;
+            my $date   = $2;
+            my $url    = $3;
+            my $status = $4;
+            my $bytes  = $5;
+            my $time   = $6;
+
+			my $check = 0;
+
+			if ( $BIN_PATH ne '' && $url =~ /$BIN_PATH_RE/ && $status == 200 && $date =~ /$date_re/) {
+			 	$check = 1;
+			} elsif ( $status == 200 && $date =~ /$date_re/ ) {
+			 	$check = 1;
+			}
+
+			if ($check) {
+                my ( $method, $script_path, $protocol ) = $url =~ /^"(\w+)\s(\S+)\s(\S+)"$/;
+
+                next unless defined $script_path; # skips URLs containing spaces
+
+                %script_stats = update_stats( \%script_stats, $script_path, $time, $bytes, $date );
+            }
+        }
+    }
+
+	#print "# %script_stats\n", Dump \%script_stats;
+
+    return %script_stats;
+}
+
+
+sub order_by {
+    $script_stats{$b}{$ORDER} <=> $script_stats{$a}{$ORDER};
+}
+
+
+sub shorten_time {
+    my $time = shift;
+
+    $time /= $TIME_UNIT;
+    $time = sprintf '%.2f', $time;
+
+    if ( length $time == 8 ) {
+        $time = sprintf '%.1f', $time;
+    }
+    elsif ( length $time == 9 ) {
+        $time = sprintf '%d', $time;
+    }
+
+    return $time;
+}
+
+
+# taken from mk-query-digest and adapted
+sub shorten_size {
+    my $bytes = shift;
+    my $prec  = 2;              # precision
+    my $div   = $BYTES_UNIT;    # divisor
+
+    my $n = 0;
+    my @units = ( '', qw(k M G T P E Z Y) );
+
+    while ( $bytes >= $div && $n < @units - 1 ) {
+        $bytes /= $div;
+        ++$n;
+    }
+
+    return sprintf( $bytes =~ m/\./ || $n
+        ? "%.${prec}f%s"
+        : '%d',
+        $bytes, $units[$n] );
+}
+
+
+sub print_detailed_stats {
+    my %stats = %{ (shift) };
+    my $LIMIT = shift;
+    my $rank  = 1;
+
+  SCRIPT:
+    foreach my $key ( sort order_by grep { $_ ne 'overall' } keys %stats ) {
+        next SCRIPT if $key eq 'overall';
+
+        last SCRIPT if $rank == $LIMIT + 1;
+
+
+        my $form_pc_calls = sprintf '%.2f', $stats{$key}{pc_calls};
+        my $form_pc_time  = sprintf '%.2f', $stats{$key}{pc_time};
+        my $form_pc_bytes = sprintf '%.2f', $stats{$key}{pc_bytes};
+
+        my $form_time = shorten_time( $stats{$key}{time} );
+        my $form_calls_per_sec = sprintf '%.3f', $stats{$key}{calls_per_sec};
+        my $form_min_time  = sprintf '%.2f', $stats{$key}{min_time} / $TIME_UNIT;
+        my $form_max_time  = sprintf '%.2f', $stats{$key}{max_time} / $TIME_UNIT;
+        my $form_mean_time = sprintf '%.2f', $stats{$key}{mean_time};
+        my $form_stddev_time = sprintf '%.2f', $stats{$key}{stddev_time};
+        my $form_median_time = sprintf '%.2f', $stats{$key}{median_time};
+        my $form_p95_time  = sprintf '%.2f', $stats{$key}{p95_time};
+
+        my $short_bytes      = shorten_size( $stats{$key}{bytes} );
+        my $short_min_bytes  = shorten_size( $stats{$key}{min_bytes} );
+        my $short_max_bytes  = shorten_size( $stats{$key}{max_bytes} );
+        my $short_mean_bytes = shorten_size( $stats{$key}{mean_bytes} );
+        my $short_stddev_bytes = shorten_size( $stats{$key}{stddev_bytes} );
+        my $short_median_bytes = shorten_size( $stats{$key}{median_bytes} );
+        my $short_p95_bytes  = shorten_size( $stats{$key}{p95_bytes} );
+
+        my $short_throughput = shorten_size( $stats{$key}{throughput} );
+
+
+        say "Script $rank: $key\tCalls/s: $form_calls_per_sec\tThroughput: $short_throughput/s";
+        say "\tpct\ttotal\tmin\tmax\tavg\t95%\tstddev\tmedian";
+
+        printf "Calls\t$form_pc_calls\t$stats{$key}{calls}\n";
+
+        printf "Time\t$form_pc_time\t$form_time\t$form_min_time\t$form_max_time\t"
+             . "$form_mean_time\t$form_p95_time\t$form_stddev_time\t$form_median_time\n";
+
+        printf "Size\t$form_pc_bytes\t$short_bytes\t$short_min_bytes\t$short_max_bytes\t"
+             . "$short_mean_bytes\t$short_p95_bytes\t$short_stddev_bytes\t$short_median_bytes\n";
+
+        say "Time range $stats{$key}{min_date} to $stats{$key}{max_date}\n";
+
+
+        say "Min time:\n$SERVER$stats{$key}{min_time_url}";
+        say "Median time:\n$SERVER$stats{$key}{median_time_url}";
+        say "95th percentile:\n$SERVER$stats{$key}{p95_time_url}";
+        say "Max time:\n$SERVER$stats{$key}{max_time_url}\n";
+
+        say "Min size:\n$SERVER$stats{$key}{min_bytes_url}";
+        say "Median size:\n$SERVER$stats{$key}{median_bytes_url}";
+        say "95th percentile:\n$SERVER$stats{$key}{p95_bytes_url}";
+        say "Max size:\n$SERVER$stats{$key}{max_bytes_url}\n\n";
+
+        $rank++;
+    }
+
+    return;
+}
+
+
+sub print_ranked_stats {
+    my %stats = %{ (shift) };
+    my $LIMIT = shift;
+    my $rank  = 1;
+
+    say "Rank\tCalls\tResponse time\tR/Call\tSize\tScript";
+    say "====\t=====\t===============\t=======\t=======\t======";
+
+  SCRIPT:
+    foreach my $key ( sort order_by grep { $_ ne 'overall' } keys %stats ) {
+        next SCRIPT if $key eq 'overall';
+        last SCRIPT if $rank == $LIMIT + 1;
+
+        my $form_time      = sprintf '%.2f', $stats{$key}{time} / $TIME_UNIT;
+        my $form_pc_time   = sprintf '%.2f', $stats{$key}{pc_time};
+        my $form_call_time = sprintf '%.3f', $stats{$key}{call_time};
+        my $short_bytes    = shorten_size( $stats{$key}{bytes} );
+
+        printf "%4s\t%5s\t%8s %5s%%\t%7s\t",
+               $rank,
+	       $stats{$key}{calls},
+	       $form_time,
+	       $form_pc_time,
+	       $form_call_time;
+        printf "$short_bytes\t";
+        say $key;
+
+        $rank++;
+    }
+
+    print "\n\n";
+
+    return;
+}
+
+
+sub print_most_freq_urls {
+    my %url_counts     = %{ (shift) };
+    my $TOP_URLS_LIMIT = 11;
+
+    say 'Most frequently requested URLs:';
+
+    my $i = 0;
+    foreach my $key ( reverse sort { $url_count{$a} <=> $url_count{$b} } keys %url_count ) {
+        last if $i == $TOP_URLS_LIMIT;
+
+        my $form_url_count = sprintf '%4s', $url_count{$key};
+        say "$form_url_count\t$SERVER$key";
+
+        $i++;
+    }
+
+    print "\n\n";
+
+    return;
+}
+
+
+sub print_summary_stats {
+    my %stats = %{ (shift) };
+
+    my $short_bytes      = shorten_size( $stats{overall}{bytes} );
+    my $short_min_bytes  = shorten_size( $stats{overall}{min_bytes} );
+    my $short_max_bytes  = shorten_size( $stats{overall}{max_bytes} );
+    my $short_mean_bytes = shorten_size( $stats{overall}{mean_bytes} );
+    my $short_stddev_bytes = shorten_size( $stats{overall}{stddev_bytes} );
+
+    my $form_calls_per_sec = sprintf '%.2f', $stats{overall}{calls_per_sec};
+    my $uniq = $stats{overall}{uniq_urls};
+
+    my $short_time       = shorten_time( $stats{overall}{time} );
+    my $short_max_time   = shorten_time( $stats{overall}{max_time} );
+    my $short_throughput = shorten_size( $stats{overall}{throughput} );
+
+    say 'Overall:';
+    say "\tCalls: $stats{overall}{calls}\t(Unique: $uniq)\tper sec: $form_calls_per_sec";
+    say "\tThroughput: $short_throughput/s\n";
+    say "\t\ttotal\tmin\tmax\tavg\tstddev";
+
+    printf "\tTime\t$short_time\t%.2f\t$short_max_time\t%.2f\t%.2f\n",
+           $stats{overall}{min_time},
+           $stats{overall}{mean_time},
+           $stats{overall}{stddev_time};
+    printf "\tSize\t$short_bytes\t$short_min_bytes\t$short_max_bytes\t$short_mean_bytes\t$short_stddev_bytes\n";
+    say "Time range $stats{overall}{min_date} to $stats{overall}{max_date}\n\n";
+
+    return;
+}
+
+
+sub set_percentiles {
+    my %stats  = %{(shift)};
+    my $script = shift;
+    my $key    = shift;
+
+    my $date_regex_check = '\d{2}\/\w{3}\/\d{4}';
+    my @elements = sort { $stats{$script}{$a}{$key} <=> $stats{$script}{$b}{$key} }
+                   grep { /$date_regex_check/ }
+                   keys %{$stats{$script}};
+
+    #my $calls    = $stats{$script}{calls};
+    my $calls     = scalar @elements;
+    # Approximate but valid when $calls is large
+    my $p95point  = int( $calls*95/100 + 1/2 );
+    $p95point = $calls if $p95point >= $calls; # $calls is small
+
+    my $odd_calls = $calls % 2;
+    my $midpoint;
+
+    if ( $odd_calls ) {
+        $midpoint = ($calls + 1)/2;
+    }
+    else {
+        $midpoint = $calls/2;
+    }
+
+    $stats{$script}{"median_$key"}      = $stats{$script}{$elements[$midpoint-1]}{$key} || 0;
+    $stats{$script}{"median_$key\_url"} = $stats{$script}{$elements[$midpoint-1]}{url}  || '';
+
+    $stats{$script}{"p95_$key"}      = $stats{$script}{$elements[$p95point-1]}{$key} || 0;
+    $stats{$script}{"p95_$key\_url"} = $stats{$script}{$elements[$p95point-1]}{url}  || '';
+
+    if ( $key eq 'time' ) {
+       $stats{$script}{"median_$key"} = $stats{$script}{"median_$key"} / $TIME_UNIT;
+       $stats{$script}{"p95_$key"}    = $stats{$script}{"p95_$key"} / $TIME_UNIT;
+    }
+
+    return 0;
+}
+
+
+sub get_stddev {
+    my %stats  = %{(shift)};
+    my $script = shift;
+    my $key    = shift;
+
+    my $mean = $stats{$script}{"mean_$key"};
+
+    my $freq          = 0;
+    my $variation_sum = 0;
+
+    my @scripts = ($script);
+    if ( $script eq 'overall' ) {
+        @scripts = ();
+        @scripts = keys %stats;
+    }
+
+    foreach my $script_new (@scripts) {
+        next if $script_new eq 'overall';
+
+	foreach my $date ( keys %{$stats{$script_new}} ) {
+	    next if $date !~ /^\[.*\]$/;
+
+	    $variation_sum += ( $stats{$script_new}{$date}{$key} - $mean )**2;
+	    $freq++;
+	}
+    }
+
+    my $stddev = 0;
+    if ( $freq != 0 ) {
+        $stddev = sqrt $variation_sum / $freq;
+    }
+
+    return $stddev;
+}
+
+
+sub calc_summary_stats {
+    my %stats        = %{(shift)};
+    my $elapsed_time = shift;
+
+    # Calculate stats for all scripts combined
+    foreach my $script ( keys %stats ) {
+        $stats{overall}{time}  += $stats{$script}{time};
+        $stats{overall}{bytes} += $stats{$script}{bytes};
+        $stats{overall}{calls} += $stats{$script}{calls};
+
+        %stats = set_value_for( \%stats, 'overall', 'min_time', $stats{$script}{min_time} / $TIME_UNIT );
+        %stats = set_value_for( \%stats, 'overall', 'max_time', $stats{$script}{max_time} );
+
+        %stats = set_value_for( \%stats, 'overall', 'min_bytes', $stats{$script}{min_bytes} );
+        %stats = set_value_for( \%stats, 'overall', 'max_bytes', $stats{$script}{max_bytes} );
+
+        %stats = set_date_extreme( \%stats, 'overall', 'min_date', $stats{$script}{min_date} );
+        %stats = set_date_extreme( \%stats, 'overall', 'max_date', $stats{$script}{max_date} );
+    }
+
+    # Calculate stats for individual scripts
+    foreach my $script ( keys %stats ) {
+        $stats{$script}{mean_time}  = $stats{$script}{time}  / ( $stats{$script}{calls} * $TIME_UNIT );
+        $stats{$script}{mean_bytes} = $stats{$script}{bytes} / $stats{$script}{calls};
+
+        $stats{$script}{call_time}     = $stats{$script}{time}  / ( $stats{$script}{calls} * $TIME_UNIT );
+	$stats{$script}{calls_per_sec} = $stats{$script}{calls} / $elapsed_time;
+        $stats{$script}{throughput}    = $stats{$script}{bytes} * $TIME_UNIT / $stats{$script}{time};
+
+        $stats{$script}{pc_time}  = $stats{$script}{time}  * 100 / $stats{overall}{time};
+        $stats{$script}{pc_bytes} = $stats{$script}{bytes} * 100 / $stats{overall}{bytes};
+        $stats{$script}{pc_calls} = $stats{$script}{calls} * 100 / $stats{overall}{calls};
+
+        next if $script eq 'overall';
+
+        $stats{$script}{stddev_time}  = get_stddev(\%stats, $script, 'time' ) / $TIME_UNIT;
+        $stats{$script}{stddev_bytes} = get_stddev(\%stats, $script, 'bytes');
+
+        set_percentiles(\%stats, $script, 'time' );
+        set_percentiles(\%stats, $script, 'bytes');
+    }
+
+    # Calculate derived stats for all scripts combined
+    # $stats{overall}{call_time} = $stats{overall}{mean_time}
+    $stats{overall}{call_time}     = $stats{overall}{time}  / ( $stats{overall}{calls} * $TIME_UNIT );
+    $stats{overall}{calls_per_sec} = $stats{overall}{calls} / $elapsed_time;
+    $stats{overall}{throughput}    = $stats{overall}{bytes} * $TIME_UNIT / $stats{overall}{time};
+
+    $stats{overall}{mean_time}  = $stats{overall}{time}  / ( $stats{overall}{calls} * $TIME_UNIT );
+    $stats{overall}{mean_bytes} = $stats{overall}{bytes} / $stats{overall}{calls};
+
+    $stats{overall}{stddev_time}  = get_stddev(\%stats, 'overall', 'time' ) / $TIME_UNIT;
+    $stats{overall}{stddev_bytes} = get_stddev(\%stats, 'overall', 'bytes');
+
+    return \%stats;
+}
+
+
+sub set_date_extreme {
+    my %stats = %{ (shift) };
+    my $path  = shift;
+    my $key   = shift;
+    my $value = shift;
+
+    my $script = get_script_name($path);
+
+    if ( !defined $stats{$script}{$key} ) {
+        $stats{$script}{$key}         = $value;
+        $stats{$script}{"$key\_url"}  = $path;
+    }
+    elsif ( $key =~ /max/ && $value gt $stats{$script}{$key} ) {
+        $stats{$script}{$key}         = $value;
+        $stats{$script}{"$key\_url"}  = $path;
+    }
+    elsif ( $key =~ /min/ && $value lt $stats{$script}{$key} ) {
+        $stats{$script}{$key}         = $value;
+        $stats{$script}{"$key\_url"}  = $path;
+    }
+
+    return %stats;
+}
+
+
+sub set_value_for {
+    my %stats = %{ (shift) };
+    my $path  = shift;
+    my $key   = shift;
+    my $value = shift;
+    my $date  = shift;
+
+    my $script = get_script_name($path);
+
+    if ( !defined $stats{$script}{$key} ) {
+        $stats{$script}{$key}         = $value;
+        $stats{$script}{"$key\_url"}  = $path;
+        $stats{$script}{"$key\_date"} = $date;
+    }
+    elsif ( $key =~ /max/ && $value > $stats{$script}{$key} ) {
+        $stats{$script}{$key}         = $value;
+        $stats{$script}{"$key\_url"}  = $path;
+        $stats{$script}{"$key\_date"} = $date;
+    }
+    elsif ( $key =~ /min/ && $value < $stats{$script}{$key} ) {
+        $stats{$script}{$key}         = $value;
+        $stats{$script}{"$key\_url"}  = $path;
+        $stats{$script}{"$key\_date"} = $date;
+    }
+
+    return %stats;
+}
+
+
+# WARNING: This ignores DAS urls
+sub get_script_name {
+    my $path = shift;
+
+    return $path if $path eq 'overall';
+
+    my ($script) = $path =~ /$BIN_PATH_RE(\w+.$SCRIPT_EXTENSION)/;
+
+    return $script;
+}
+
+
+sub update_stats {
+    my %stats = %{ (shift) };
+    my $path  = shift;
+    my $time  = shift;
+    my $bytes = shift;
+    my $date  = shift;
+
+    my $script = get_script_name($path);
+
+    if ( !defined $url_count{$path} ) {
+        $stats{overall}{uniq_urls}++;
+    }
+
+    $url_count{$path}++;
+
+    if ( defined $script ) {
+        $stats{$script}{calls}++;
+        $stats{$script}{bytes} += $bytes;
+        $stats{$script}{time}  += $time;
+
+        $stats{$script}{$date}{bytes} += $bytes;
+        $stats{$script}{$date}{time}  += $time;
+        $stats{$script}{$date}{url}    = $path;
+
+        %stats = set_value_for( \%stats, $path, 'min_time', $time, $date );
+        %stats = set_value_for( \%stats, $path, 'max_time', $time, $date );
+
+        %stats = set_value_for( \%stats, $path, 'min_bytes', $bytes, $date );
+        %stats = set_value_for( \%stats, $path, 'max_bytes', $bytes, $date );
+
+        %stats = set_date_extreme( \%stats, $path, 'min_date', $date );
+        %stats = set_date_extreme( \%stats, $path, 'max_date', $date );
+    }
+
+    return %stats;
+}
+
+
+sub check_cli_opts {
+    my $logfile     = shift;
+    my $LIMIT       = shift;
+    my $ORDER       = shift;
+    my $date_re     = shift;
+    my @VALID_ORDER = @{ (shift) };
+
+    my $date_regex_check = '\d{2}\/\w{3}\/\d{4}';
+
+    die "Access log file ($logfile) does not exist!\n" unless -e $logfile;
+
+    die "Limit ($LIMIT) is not an integer\n" unless $LIMIT =~ /^\d+$/;
+
+    die "Order by ($ORDER) must be one of: @VALID_ORDER\n"
+      unless grep { /$ORDER/ } @VALID_ORDER;
+
+    die "Date regex ($date_re) does not match \"$date_regex_check\"\n"
+      unless $date_re =~ /$date_regex_check/;
+
+    return;
+}
+
+
+sub usage {
+    my $DEF_LIMIT = shift;
+    my @VALID_ORDER = @{ (shift) };
+
+    print "apache-response-time is a performance analysis tool for the apache web server.\n\n\n";
+
+    print "Usage: $0 [options]\n\n\n";
+
+    print "Options:\n"
+        . " -a access.log, --access-log=access.log\tApache access log file\n"
+	. "\t\t\t\t\t(Default: /var/log/apache2/access.log)\n\n"
+	. " -d date regex, --date=date regex\tDate regex e.g. 06/Jun/2009\n"
+	. "\t\t\t\t\t(Default: today)\n\n"
+	. " -o order,      --order-by=order\tOrder of results\n"
+	. "\t\t\t\t\tOne of: @VALID_ORDER\n"
+	. "\t\t\t\t\t(Default: count)\n\n"
+	. " -l limit,      --limit=limit\t\tLimit number of ranked scripts\n"
+	. "\t\t\t\t\t(Default: $DEF_LIMIT)\n\n"
+	. " -s server,     --server=server\t\tDomain name of web server\n"
+	. "\t\t\t\t\t(Default: none)\n\n"
+	. " -b bin_path,   --bin-path=bin_path\tPath to script directory\n"
+	. "\t\t\t\t\t(Default: cgi-bin)\n\n"
+	. " -e extension   --extension=extension\tScript file extension\n"
+	. "\t\t\t\t\t(Default: cgi)\n\n"
+	. " -h             --help\t\t\tHelp message\n\n\n";
+
+    print "Examples:\n\n"
+        . " apache-response-time -o time -l 5 -s http://acme.com/ -b Rockets -e php\n\n"
+        . "Top 5 php scripts, ordered by time, in the Rockets web application.\n"
+        . "Example links will have the form: http://acme.org/Rockets/Drying_paint.php?page=7.\n\n\n";
+
+    exit;
+}
+
+###############################################################################
+#
+# sub:          say
+# Summary:      prints arguments followed by a new line
+# Description:  a say statement is included in perl 5.10
+# Parameters:   args appear in @_
+# Return:       arguments followed by a new line, to STDOUT
+
+sub say { print qq{@_\n}; }    # automagically adds a space between arguments
+
+#sub say { print @_, "\n"; } # no space between arguments
+
+###############################################################################
+#
+# sub:          slurp
+# Summary:      slurps contents of a file into a scalar or array
+# Description:  to become available in perl 6 and 5.10
+# Parameters:   $file
+# Return:       scalar ($r[0]) or array (@r) of file contents
+
+sub slurp {
+    my ($file) = @_;
+
+    local $/ = wantarray ? $/ : undef;
+    local (*F);
+    my @r;
+
+    open F, '<', $file || die "open $file: $!";
+    @r = <F>;
+    close F || die "close $file: $!";
+
+    return $r[0] unless wantarray;
+    return @r;
+}
+
